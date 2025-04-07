@@ -16,6 +16,7 @@ package client
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -31,6 +32,12 @@ type DopplerClient struct {
 	DopplerToken string
 	VerifyTLS    bool
 	UserAgent    string
+	Cache        map[string]*CacheEntry
+}
+
+type CacheEntry struct {
+	ETag string
+	Data *SecretsResponse
 }
 
 type queryParams map[string]string
@@ -75,6 +82,7 @@ type SecretsRequest struct {
 	Config          string
 	NameTransformer string
 	Format          string
+	SecretNames     []string
 	ETag            string // Specifying an ETag implies that the caller has implemented response caching
 }
 
@@ -85,33 +93,23 @@ type UpdateSecretsRequest struct {
 	Config         string   `json:"config,omitempty"`
 }
 
-type secretResponseBody struct {
-	Name  string `json:"name,omitempty"`
-	Value struct {
-		Raw      *string `json:"raw"`
-		Computed *string `json:"computed"`
-	} `json:"value,omitempty"`
-	Messages *[]string `json:"messages,omitempty"`
-	Success  bool      `json:"success"`
-}
-
 type SecretResponse struct {
 	Name  string
 	Value string
 }
 
 type SecretsResponse struct {
-	Secrets  Secrets
-	Body     []byte
-	Modified bool
-	ETag     string
+	Secrets Secrets
+	Body    []byte
+	ETag    string
 }
 
-func NewDopplerClient(dopplerToken string) (*DopplerClient, error) {
+func NewDopplerClient(dopplerToken string, cache map[string]*CacheEntry) (*DopplerClient, error) {
 	client := &DopplerClient{
 		DopplerToken: dopplerToken,
 		VerifyTLS:    true,
 		UserAgent:    "doppler-external-secrets",
+		Cache:        cache,
 	}
 
 	if err := client.SetBaseURL("https://api.doppler.com"); err != nil {
@@ -119,6 +117,21 @@ func NewDopplerClient(dopplerToken string) (*DopplerClient, error) {
 	}
 
 	return client, nil
+}
+
+func (c *DopplerClient) CacheKey(request SecretsRequest) string {
+	hasher := sha1.New()
+	key := fmt.Sprintf("%s:%s", c.DopplerToken, strings.Join(request.SecretNames, "/"))
+	hasher.Write([]byte(key))
+	secretNamesHash := fmt.Sprintf("%x", hasher.Sum(nil))
+	return fmt.Sprintf("%s:%s:%s:%s:%s", request.Project, request.Config, request.NameTransformer, request.Format, secretNamesHash[:12])
+}
+
+func (c *DopplerClient) UpdateCache(cacheKey string, etag string, data *SecretsResponse) error {
+	fmt.Printf("Updating cache for %s. New ETag: %s\n", cacheKey, etag)
+	c.Cache[cacheKey] = &CacheEntry{ETag: etag, Data: data}
+
+	return nil
 }
 
 func (c *DopplerClient) BaseURL() *url.URL {
@@ -151,30 +164,43 @@ func (c *DopplerClient) Authenticate() error {
 }
 
 func (c *DopplerClient) GetSecret(request SecretRequest) (*SecretResponse, error) {
-	params := request.buildQueryParams(request.Name)
-	response, err := c.performRequest("/v3/configs/config/secret", "GET", headers{}, params, httpRequestBody{})
+	secretsRequest := SecretsRequest{
+		Project:         request.Project,
+		Config:          request.Config,
+		SecretNames:     []string{request.Name},
+		Format:          "",
+		NameTransformer: "",
+	}
+	response, err := c.GetSecrets(secretsRequest)
 	if err != nil {
 		return nil, err
 	}
 
-	var data secretResponseBody
-	if err := json.Unmarshal(response.Body, &data); err != nil {
-		return nil, &APIError{Err: err, Message: "unable to unmarshal secret payload", Data: string(response.Body)}
+	secretName := request.Name
+	secretValue, ok := response.Secrets[request.Name]
+
+	if !ok {
+		return nil, &APIError{Message: fmt.Sprintf("secret '%s' not found", secretName)}
 	}
 
-	if data.Value.Computed == nil {
-		return nil, &APIError{Message: fmt.Sprintf("secret '%s' not found", request.Name)}
-	}
-
-	return &SecretResponse{Name: data.Name, Value: *data.Value.Computed}, nil
+	return &SecretResponse{Name: secretName, Value: secretValue}, nil
 }
 
-// GetSecrets should only have an ETag supplied if Secrets are cached as SecretsResponse.Secrets will be nil if 304 (not modified) returned.
+// GetSecrets will either returned the cached response (when the response ETag matches
+// the cache) or the full response (which is then cached). If we have a cache entry for
+// the request, we pull its ETag and send that in an `if-none-match` header. If we get
+// a 304 response, then secrets haven't changed and we then return that cached result.
 func (c *DopplerClient) GetSecrets(request SecretsRequest) (*SecretsResponse, error) {
 	headers := headers{}
-	if request.ETag != "" {
-		headers["if-none-match"] = request.ETag
+
+	cacheKey := c.CacheKey(request)
+	cacheEntry, cacheEntryFound := c.Cache[cacheKey]
+	if cacheEntryFound {
+		if cacheEntry.ETag != "" {
+			headers["if-none-match"] = cacheEntry.ETag
+		}
 	}
+
 	if request.Format != "" && request.Format != "json" {
 		headers["accept"] = "text/plain"
 	}
@@ -185,22 +211,27 @@ func (c *DopplerClient) GetSecrets(request SecretsRequest) (*SecretsResponse, er
 		return nil, apiErr
 	}
 
-	if response.HTTPResponse.StatusCode == 304 {
-		return &SecretsResponse{Modified: false, Secrets: nil, ETag: request.ETag}, nil
+	if cacheEntryFound && response.HTTPResponse.StatusCode == 304 {
+		fmt.Printf("Skipping cache update for %s. Cached ETag: %s\n", cacheKey, cacheEntry.ETag)
+		return cacheEntry.Data, nil
 	}
 
-	eTag := response.HTTPResponse.Header.Get("etag")
-
+	responseETag := response.HTTPResponse.Header.Get("ETag")
 	// Format defeats JSON parsing
 	if request.Format != "" {
-		return &SecretsResponse{Modified: true, Body: response.Body, ETag: eTag}, nil
+		secretsResponse := &SecretsResponse{Body: response.Body, ETag: responseETag}
+		c.UpdateCache(cacheKey, responseETag, secretsResponse)
+		return secretsResponse, nil
 	}
 
 	var secrets Secrets
 	if err := json.Unmarshal(response.Body, &secrets); err != nil {
 		return nil, &APIError{Err: err, Message: "unable to unmarshal secrets payload"}
 	}
-	return &SecretsResponse{Modified: true, Secrets: secrets, Body: response.Body, ETag: eTag}, nil
+
+	secretsResponse := &SecretsResponse{Secrets: secrets, Body: response.Body, ETag: responseETag}
+	c.UpdateCache(cacheKey, responseETag, secretsResponse)
+	return secretsResponse, nil
 }
 
 func (c *DopplerClient) UpdateSecrets(request UpdateSecretsRequest) error {
@@ -215,21 +246,6 @@ func (c *DopplerClient) UpdateSecrets(request UpdateSecretsRequest) error {
 	return nil
 }
 
-func (r *SecretRequest) buildQueryParams(name string) queryParams {
-	params := queryParams{}
-	params["name"] = name
-
-	if r.Project != "" {
-		params["project"] = r.Project
-	}
-
-	if r.Config != "" {
-		params["config"] = r.Config
-	}
-
-	return params
-}
-
 func (r *SecretsRequest) buildQueryParams() queryParams {
 	params := queryParams{}
 
@@ -239,6 +255,10 @@ func (r *SecretsRequest) buildQueryParams() queryParams {
 
 	if r.Config != "" {
 		params["config"] = r.Config
+	}
+
+	if len(r.SecretNames) > 0 {
+		params["secrets"] = strings.Join(r.SecretNames, ",")
 	}
 
 	if r.NameTransformer != "" {
