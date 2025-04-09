@@ -234,14 +234,33 @@ func (c *DopplerClient) GetSecrets(request SecretsRequest) (*SecretsResponse, er
 	return secretsResponse, nil
 }
 
+// Secret writes are much more expensive to perform than reads. Since secrets likely
+// don't change that often, we perform a fetch and only issue writes if the secret
+// values have changed.
 func (c *DopplerClient) UpdateSecrets(request UpdateSecretsRequest) error {
-	body, jsonErr := json.Marshal(request)
-	if jsonErr != nil {
-		return &APIError{Err: jsonErr, Message: "unable to unmarshal update secrets payload"}
-	}
-	_, err := c.performRequest("/v3/configs/config/secrets", "POST", headers{}, queryParams{}, body)
+	response, err := c.GetSecrets(SecretsRequest{Project: request.Project, Config: request.Config, NameTransformer: "", Format: ""})
 	if err != nil {
 		return err
+	}
+
+	for secretName, newValue := range request.Secrets {
+		oldValue := response.Secrets[secretName]
+		if oldValue == newValue {
+			fmt.Printf("Skipping secret push for %s. Value hasn't changed.\n", secretName)
+			delete(request.Secrets, secretName)
+		}
+	}
+
+	if len(request.Secrets) > 0 {
+		body, jsonErr := json.Marshal(request)
+		if jsonErr != nil {
+			return &APIError{Err: jsonErr, Message: "unable to unmarshal update secrets payload"}
+		}
+		fmt.Printf("Performing secret push.\n")
+		_, err = c.performRequest("/v3/configs/config/secrets", "POST", headers{}, queryParams{}, body)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
