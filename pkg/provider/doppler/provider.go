@@ -20,12 +20,14 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
 	dClient "github.com/external-secrets/external-secrets/pkg/provider/doppler/client"
+	"github.com/external-secrets/external-secrets/pkg/provider/doppler/safecache"
 	"github.com/external-secrets/external-secrets/pkg/utils"
 )
 
@@ -43,8 +45,9 @@ var _ esv1.SecretsClient = &Client{}
 var _ esv1.Provider = &Provider{}
 
 // We have to use a global variable for the cache because a new provider client
-// is created for each request in the reconcile loop.
-var globalCache = make(map[string]*dClient.CacheEntry)
+// is created for each request in the reconcile loop. We keep a separate cache
+// for each SecretStore to allow for separate TTLs.
+var globalCache = make(map[string]*safecache.SafeCache)
 
 func init() {
 	esv1.Register(&Provider{}, &esv1.SecretStoreProvider{
@@ -75,7 +78,25 @@ func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube 
 		store:     dopplerStoreSpec,
 		namespace: namespace,
 		storeKind: store.GetObjectKind().GroupVersionKind().Kind,
-		cache:     globalCache,
+	}
+
+	// Enable response caching if the user so chooses. What determines if the cache
+	// is used or not is whether we pass in a `safecache.SafeCache` to NewDopplerClient()
+	// or nil.
+	if storeSpec.Provider.Doppler.Cache != nil && storeSpec.Provider.Doppler.Cache.Enable != nil && *storeSpec.Provider.Doppler.Cache.Enable {
+		dopplerStoreUID := string(store.GetObjectMeta().UID)
+		if globalCache[dopplerStoreUID] == nil {
+			globalCache[dopplerStoreUID] = safecache.NewCache()
+		}
+		client.cache = globalCache[dopplerStoreUID]
+		client.cache.Enable()
+
+		// The safecache.defaultCacheEntryTTL is used for the entry TTL unless the
+		// user provides their own value.
+		if storeSpec.Provider.Doppler.Cache.TTL != nil {
+			newTTL := time.Duration(*storeSpec.Provider.Doppler.Cache.TTL) * time.Second
+			client.cache.SetCacheEntryTTL(newTTL)
+		}
 	}
 
 	if err := client.setAuth(ctx); err != nil {

@@ -29,6 +29,7 @@ import (
 	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
 	"github.com/external-secrets/external-secrets/pkg/find"
 	dClient "github.com/external-secrets/external-secrets/pkg/provider/doppler/client"
+	"github.com/external-secrets/external-secrets/pkg/provider/doppler/safecache"
 	"github.com/external-secrets/external-secrets/pkg/utils"
 	"github.com/external-secrets/external-secrets/pkg/utils/resolvers"
 )
@@ -58,7 +59,7 @@ type Client struct {
 	store     *esv1.DopplerProvider
 	namespace string
 	storeKind string
-	cache     map[string]*dClient.CacheEntry
+	cache     *safecache.SafeCache
 }
 
 // SecretsClientInterface defines the required Doppler Client methods.
