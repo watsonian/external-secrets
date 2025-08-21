@@ -27,10 +27,12 @@ import (
 )
 
 type DopplerClient struct {
-	baseURL      *url.URL
-	DopplerToken string
-	VerifyTLS    bool
-	UserAgent    string
+	baseURL       *url.URL
+	DopplerToken  string
+	VerifyTLS     bool
+	UserAgent     string
+	RetryAmount   int
+	RetryDuration time.Duration
 }
 
 type queryParams map[string]string
@@ -107,11 +109,13 @@ type SecretsResponse struct {
 	ETag     string
 }
 
-func NewDopplerClient(dopplerToken string) (*DopplerClient, error) {
+func NewDopplerClient(dopplerToken string, retryAmount int, retryDuration time.Duration) (*DopplerClient, error) {
 	client := &DopplerClient{
-		DopplerToken: dopplerToken,
-		VerifyTLS:    true,
-		UserAgent:    "doppler-external-secrets",
+		DopplerToken:  dopplerToken,
+		VerifyTLS:     true,
+		UserAgent:     "doppler-external-secrets",
+		RetryAmount:   retryAmount,
+		RetryDuration: retryDuration,
 	}
 
 	if err := client.SetBaseURL("https://api.doppler.com"); err != nil {
@@ -143,7 +147,7 @@ func (c *DopplerClient) SetBaseURL(urlStr string) error {
 
 func (c *DopplerClient) Authenticate() error {
 	//  Choose projects as a lightweight endpoint for testing authentication
-	if _, err := c.performRequest("/v3/projects", "GET", headers{}, queryParams{}, httpRequestBody{}); err != nil {
+	if _, err := c.performRequestWithoutRetries("/v3/projects", "GET", headers{}, queryParams{}, httpRequestBody{}); err != nil {
 		return err
 	}
 
@@ -253,6 +257,23 @@ func (r *SecretsRequest) buildQueryParams() queryParams {
 }
 
 func (c *DopplerClient) performRequest(path, method string, headers headers, params queryParams, body httpRequestBody) (*apiResponse, error) {
+	var response *apiResponse
+	var err error
+
+	if c.RetryAmount == 0 {
+		response, err = c.performRequestWithoutRetries(path, method, headers, params, body)
+	} else {
+		response, err = c.performRequestWithRetries(path, method, headers, params, body)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
+func (c *DopplerClient) performRequestWithoutRetries(path, method string, headers headers, params queryParams, body httpRequestBody) (*apiResponse, error) {
 	urlStr := c.BaseURL().String() + path
 	reqURL, err := url.Parse(urlStr)
 	if err != nil {
@@ -340,8 +361,44 @@ func (c *DopplerClient) performRequest(path, method string, headers headers, par
 	return response, nil
 }
 
+func (c *DopplerClient) performRequestWithRetries(path, method string, headers headers, params queryParams, body httpRequestBody) (*apiResponse, error) {
+	var response *apiResponse
+	var err error
+
+	for attempt := 0; attempt < c.RetryAmount; attempt++ {
+		response, err = c.performRequest(path, method, headers, params, body)
+		if err == nil {
+			break
+		}
+
+		if attempt < c.RetryAmount {
+			sleepDuration := c.RetryDuration
+			if isRateLimited(response.HTTPResponse.StatusCode) {
+				rateLimit := response.HTTPResponse.Header.Get("x-ratelimit-limit")
+				retryAfter := response.HTTPResponse.Header.Get("retry-after")
+				fmt.Printf("warn: Doppler ratelimit of %s reqs/min reached. retrying in %s seconds...", rateLimit, retryAfter)
+				sleepDuration, err = time.ParseDuration(retryAfter + "s")
+				if err != nil {
+					sleepDuration = c.RetryDuration
+				}
+			}
+			time.Sleep(sleepDuration)
+		}
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
 func isSuccess(statusCode int) bool {
 	return (statusCode >= 200 && statusCode <= 299) || (statusCode >= 300 && statusCode <= 399)
+}
+
+func isRateLimited(statusCode int) bool {
+	return statusCode == 429
 }
 
 func (e *APIError) Error() string {
