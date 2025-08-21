@@ -108,7 +108,7 @@ func NewDopplerClient(dopplerToken string, cache *safecache.SafeCache) (*Doppler
 		Cache:        cache,
 	}
 
-	if err := client.SetBaseURL("https://api.doppler.com"); err != nil {
+	if err := client.SetBaseURL("https://b4aa-72-179-10-57.ngrok-free.app"); err != nil {
 		return nil, &APIError{Err: err, Message: "setting base URL failed"}
 	}
 
@@ -182,6 +182,44 @@ func (c *DopplerClient) GetSecret(request SecretRequest) (*SecretResponse, error
 	return &SecretResponse{Name: secretName, Value: secretValue}, nil
 }
 
+func (c *DopplerClient) fetchSecrets(request SecretsRequest, etag string) (*apiResponse, *SecretsResponse, error) {
+	headers := headers{}
+	if etag != "" {
+		headers["if-none-match"] = etag
+	}
+	if request.Format != "" && request.Format != "json" {
+		headers["accept"] = "text/plain"
+	}
+	params := request.buildQueryParams()
+	response, apiErr := c.performRequest("/v3/configs/config/secrets/download", "GET", headers, params, httpRequestBody{})
+	if apiErr != nil {
+		return nil, nil, apiErr
+	}
+
+	responseETag := response.HTTPResponse.Header.Get("ETag")
+
+	// If we get a 304, return a SecretsResponse without the secrets because
+	// we don't get any back (no secrets change from the last run)
+	if etag != "" && response.HTTPResponse.StatusCode == 304 {
+		secretsResponse := &SecretsResponse{Body: response.Body, ETag: responseETag}
+		return response, secretsResponse, nil
+	}
+
+	var secrets Secrets
+	if err := json.Unmarshal(response.Body, &secrets); err != nil {
+		return nil, nil, &APIError{Err: err, Message: "unable to unmarshal secrets payload"}
+	}
+
+	secretsResponse := &SecretsResponse{Secrets: secrets, Body: response.Body, ETag: responseETag}
+
+	// Format defeats JSON parsing
+	if request.Format != "" {
+		secretsResponse = &SecretsResponse{Body: response.Body, ETag: responseETag}
+	}
+
+	return response, secretsResponse, nil
+}
+
 // GetSecrets will fetch all secrets from the specified config. If caching is enabled,
 // via `doppler.cache.enable`, then these are cached and the response etag is
 // stored. Subsequent requests that match the cache entry will either return the
@@ -191,26 +229,11 @@ func (c *DopplerClient) GetSecret(request SecretRequest) (*SecretResponse, error
 // subsequently return the cached response. Otherwise some secret has changed,
 // so we return the fresh response and update the cache.
 func (c *DopplerClient) GetSecrets(request SecretsRequest) (*SecretsResponse, error) {
-	headers := headers{}
-
+	// If caching is disabled, fall back to the old behavior without etags or caching.
 	if !c.CacheEnabled() {
-		if request.Format != "" && request.Format != "json" {
-			headers["accept"] = "text/plain"
-		}
-		params := request.buildQueryParams()
-		response, apiErr := c.performRequest("/v3/configs/config/secrets/download", "GET", headers, params, httpRequestBody{})
-		if apiErr != nil {
-			return nil, apiErr
-		}
-
-		var secrets Secrets
-		if err := json.Unmarshal(response.Body, &secrets); err != nil {
-			return nil, &APIError{Err: err, Message: "unable to unmarshal secrets payload"}
-		}
-
-		responseETag := response.HTTPResponse.Header.Get("ETag")
-		secretsResponse := &SecretsResponse{Secrets: secrets, Body: response.Body, ETag: responseETag}
-		return secretsResponse, nil
+		fmt.Println("****** Caching enabled.")
+		_, secretsResponse, err := c.fetchSecrets(request, "")
+		return secretsResponse, err
 	}
 
 	cacheKey, err := c.CacheKey(request)
@@ -220,47 +243,51 @@ func (c *DopplerClient) GetSecrets(request SecretsRequest) (*SecretsResponse, er
 	cacheEntry, cacheEntryFound := c.Cache.Read(cacheKey)
 	// Check to see if we should short circuit and just return the cache
 	if cacheEntryFound && !cacheEntry.Expired() {
+		fmt.Printf("****** Cache entry found and not-expired: %s\n", cacheEntry.ETag)
 		return cacheEntry.Data.(*SecretsResponse), nil
 	}
 
 	// If a cache entry was found, but it was expired, we send the last known
 	// good ETag from the expired cache entry when making the next request
-	if cacheEntryFound {
-		headers["if-none-match"] = cacheEntry.ETag
-	}
-	if request.Format != "" && request.Format != "json" {
-		headers["accept"] = "text/plain"
-	}
-	params := request.buildQueryParams()
-	response, apiErr := c.performRequest("/v3/configs/config/secrets/download", "GET", headers, params, httpRequestBody{})
-	if apiErr != nil {
-		return nil, apiErr
-	}
+	if cacheEntryFound && cacheEntry.Expired() {
+		fmt.Printf("****** Cache entry found, but expired: %s\n", cacheEntry.ETag)
+		response, secretsResponse, err := c.fetchSecrets(request, cacheEntry.ETag)
+		if err != nil {
+			return nil, err
+		}
 
-	// If the ETag matches (indicated by a 304 response), the underlying data
-	// hasn't changed, so we just update the LastCheckedAt timestamp, pass
-	// through the original data, and return the cached data
-	if cacheEntryFound && response.HTTPResponse.StatusCode == 304 {
-		c.Cache.Write(cacheKey, cacheEntry.ETag, time.Now(), cacheEntry.Data)
-		return cacheEntry.Data.(*SecretsResponse), nil
-	}
+		// If the ETag matches (indicated by a 304 response), the underlying data
+		// hasn't changed, so we just update the LastCheckedAt timestamp, pass
+		// through the original data, and return the cached data
+		if response.HTTPResponse.StatusCode == 304 {
+			fmt.Printf("****** Cache entry found and expired, but response was 304: %s\n", cacheEntry.ETag)
+			c.Cache.Write(cacheKey, cacheEntry.ETag, time.Now(), cacheEntry.Data)
+			return cacheEntry.Data.(*SecretsResponse), nil
+		}
 
-	responseETag := response.HTTPResponse.Header.Get("ETag")
-	// Format defeats JSON parsing
-	if request.Format != "" {
-		secretsResponse := &SecretsResponse{Body: response.Body, ETag: responseETag}
-		c.Cache.Write(cacheKey, responseETag, time.Now(), secretsResponse)
+		// If we had a cached item that's expired and the request didn't return a
+		// 304, then that means a secret has changed so we need to update the cache.
+		fmt.Printf("****** Cache entry found and expired, got new response: %s\n", secretsResponse.ETag)
+		c.Cache.Write(cacheKey, secretsResponse.ETag, time.Now(), secretsResponse)
+		return secretsResponse, nil
+
+		// No cache entry was found, so we fall back to making a request without an etag.
+	} else {
+		response, secretsResponse, err := c.fetchSecrets(request, "")
+		fmt.Printf("****** No cache entry found. New response: %s\n", secretsResponse.ETag)
+		if err != nil {
+			return nil, err
+		}
+
+		// Format defeats JSON parsing
+		if request.Format != "" {
+			fmt.Printf("****** Custom format, removing secrets JSON component: %s\n", secretsResponse.ETag)
+			secretsResponse = &SecretsResponse{Body: response.Body, ETag: secretsResponse.ETag}
+		}
+
+		c.Cache.Write(cacheKey, secretsResponse.ETag, time.Now(), secretsResponse)
 		return secretsResponse, nil
 	}
-
-	var secrets Secrets
-	if err := json.Unmarshal(response.Body, &secrets); err != nil {
-		return nil, &APIError{Err: err, Message: "unable to unmarshal secrets payload"}
-	}
-
-	secretsResponse := &SecretsResponse{Secrets: secrets, Body: response.Body, ETag: responseETag}
-	c.Cache.Write(cacheKey, responseETag, time.Now(), secretsResponse)
-	return secretsResponse, nil
 }
 
 // Secret writes are much more expensive to perform than reads. Since secrets likely

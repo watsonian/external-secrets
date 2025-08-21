@@ -80,9 +80,13 @@ func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube 
 		storeKind: store.GetObjectKind().GroupVersionKind().Kind,
 	}
 
-	// Enable response caching if the user so chooses. What determines if the cache
-	// is used or not is whether we pass in a `safecache.SafeCache` to NewDopplerClient()
-	// or nil.
+	// Enable response caching based on the user's configuration. The user can either
+	// not specify any cache settings at all (which will result in no caching being
+	// used), can specify a cache configuration that has `enable` set to false (which
+	// will result in no caching being used), or can specify settings and enable the
+	// caching. Internally, we determines if the cache is used by a combination of
+	// client.cache being nil (or not) and if it isn't nil, whether cache.Enabled()
+	// returns true.
 	if storeSpec.Provider.Doppler.Cache != nil && storeSpec.Provider.Doppler.Cache.Enable != nil && *storeSpec.Provider.Doppler.Cache.Enable {
 		dopplerStoreUID := string(store.GetObjectMeta().UID)
 		if globalCache[dopplerStoreUID] == nil {
