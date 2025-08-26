@@ -222,16 +222,15 @@ func (c *DopplerClient) fetchSecrets(request SecretsRequest, etag string) (*apiR
 
 // GetSecrets will fetch all secrets from the specified config. If caching is enabled,
 // via `doppler.cache.enable`, then these are cached and the response etag is
-// stored. Subsequent requests that match the cache entry will either return the
-// cached response immediately if made within `doppler.cache.ttl` seconds of the
-// last request, or send the request in with the `if-none-match` header set to
-// the cached etag. If nothing has changed, we get a 304 response back and
-// subsequently return the cached response. Otherwise some secret has changed,
-// so we return the fresh response and update the cache.
+// stored. Subsequent requests that match the cache entry will send the request
+// in with the `if-none-match` header set to the cached etag. If nothing has
+// changed, we get a 304 response back and subsequently return the cached response.
+// Otherwise some secret has changed, so we return the fresh response and update
+// the cache.
 func (c *DopplerClient) GetSecrets(request SecretsRequest) (*SecretsResponse, error) {
 	// If caching is disabled, fall back to the old behavior without etags or caching.
 	if !c.CacheEnabled() {
-		fmt.Println("****** Caching enabled.")
+		fmt.Println("****** Caching disabled.")
 		_, secretsResponse, err := c.fetchSecrets(request, "")
 		return secretsResponse, err
 	}
@@ -241,16 +240,10 @@ func (c *DopplerClient) GetSecrets(request SecretsRequest) (*SecretsResponse, er
 		return nil, err
 	}
 	cacheEntry, cacheEntryFound := c.Cache.Read(cacheKey)
-	// Check to see if we should short circuit and just return the cache
-	if cacheEntryFound && !cacheEntry.Expired() {
-		fmt.Printf("****** Cache entry found and not-expired: %s\n", cacheEntry.ETag)
-		return cacheEntry.Data.(*SecretsResponse), nil
-	}
-
-	// If a cache entry was found, but it was expired, we send the last known
-	// good ETag from the expired cache entry when making the next request
-	if cacheEntryFound && cacheEntry.Expired() {
-		fmt.Printf("****** Cache entry found, but expired: %s\n", cacheEntry.ETag)
+	// If a cache entry was found we send the last known good ETag when making the
+	// next request
+	if cacheEntryFound {
+		fmt.Printf("****** Cache entry found: %s\n", cacheEntry.ETag)
 		response, secretsResponse, err := c.fetchSecrets(request, cacheEntry.ETag)
 		if err != nil {
 			return nil, err
@@ -260,14 +253,14 @@ func (c *DopplerClient) GetSecrets(request SecretsRequest) (*SecretsResponse, er
 		// hasn't changed, so we just update the LastCheckedAt timestamp, pass
 		// through the original data, and return the cached data
 		if response.HTTPResponse.StatusCode == 304 {
-			fmt.Printf("****** Cache entry found and expired, but response was 304: %s\n", cacheEntry.ETag)
+			fmt.Printf("****** Cache entry found, but response was 304: %s\n", cacheEntry.ETag)
 			c.Cache.Write(cacheKey, cacheEntry.ETag, time.Now(), cacheEntry.Data)
 			return cacheEntry.Data.(*SecretsResponse), nil
 		}
 
-		// If we had a cached item that's expired and the request didn't return a
-		// 304, then that means a secret has changed so we need to update the cache.
-		fmt.Printf("****** Cache entry found and expired, got new response: %s\n", secretsResponse.ETag)
+		// If we had a cached item and the request didn't return a 304, then that
+		// means a secret has changed so we need to update the cache.
+		fmt.Printf("****** Cache entry found, got new response: %s\n", secretsResponse.ETag)
 		c.Cache.Write(cacheKey, secretsResponse.ETag, time.Now(), secretsResponse)
 		return secretsResponse, nil
 

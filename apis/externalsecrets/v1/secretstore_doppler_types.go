@@ -33,17 +33,16 @@ type DopplerAuthSecretRef struct {
 
 // DopplerCache configures whether or not the provider performs any response
 // caching. This can be useful to reduce the number of requests hitting Doppler's
-// API – reducing the chance of hitting API rate limits. Recommended for setups
-// with large numbers of ExternalSecrets.
+// API – reducing the chance of hitting API rate limits. This is enabled by default.
 type DopplerCache struct {
+	// Defaults to true
 	Enable *bool `json:"enable,omitempty"`
-	TTL    *int  `json:"ttl,omitempty"`
 }
 
 // DopplerProvider configures a store to sync secrets using the Doppler provider.
 // Project and Config are required if not using a Service Token.
 type DopplerProvider struct {
-	// Cache configures whether and how the provider caches responses.
+	// Cache configures whether the provider caches responses.
 	Cache *DopplerCache `json:"cache,omitempty"`
 
 	// Auth configures how the Operator authenticates with the Doppler API

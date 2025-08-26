@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"time"
 
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -80,27 +79,21 @@ func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube 
 		storeKind: store.GetObjectKind().GroupVersionKind().Kind,
 	}
 
-	// Enable response caching based on the user's configuration. The user can either
-	// not specify any cache settings at all (which will result in no caching being
-	// used), can specify a cache configuration that has `enable` set to false (which
-	// will result in no caching being used), or can specify settings and enable the
-	// caching. Internally, we determines if the cache is used by a combination of
-	// client.cache being nil (or not) and if it isn't nil, whether cache.Enabled()
-	// returns true.
-	if storeSpec.Provider.Doppler.Cache != nil && storeSpec.Provider.Doppler.Cache.Enable != nil && *storeSpec.Provider.Doppler.Cache.Enable {
-		dopplerStoreUID := string(store.GetObjectMeta().UID)
-		if globalCache[dopplerStoreUID] == nil {
-			globalCache[dopplerStoreUID] = safecache.NewCache()
-		}
-		client.cache = globalCache[dopplerStoreUID]
+	// Toggle response caching based on the user's configuration. The user can either
+	// not specify any cache settings at all (which will result in caching being enabled)
+	// or can specify a cache configuration that has `enable` set to false (which
+	// will result in no caching being used) or `true` (which also enables the cache).
+	// Internally, we determines if the cache is used by a combination of client.cache
+	// being nil (or not) and if it isn't nil, whether cache.Enabled() returns true.
+	dopplerStoreUID := string(store.GetObjectMeta().UID)
+	if globalCache[dopplerStoreUID] == nil {
+		globalCache[dopplerStoreUID] = safecache.NewCache()
+	}
+	client.cache = globalCache[dopplerStoreUID]
+	if storeSpec.Provider.Doppler.Cache != nil && storeSpec.Provider.Doppler.Cache.Enable != nil && !(*storeSpec.Provider.Doppler.Cache.Enable) {
+		client.cache.Disable()
+	} else {
 		client.cache.Enable()
-
-		// The safecache.defaultCacheEntryTTL is used for the entry TTL unless the
-		// user provides their own value.
-		if storeSpec.Provider.Doppler.Cache.TTL != nil {
-			newTTL := time.Duration(*storeSpec.Provider.Doppler.Cache.TTL) * time.Second
-			client.cache.SetCacheEntryTTL(newTTL)
-		}
 	}
 
 	if err := client.setAuth(ctx); err != nil {

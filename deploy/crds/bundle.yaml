@@ -3617,12 +3617,11 @@ spec:
                             - secretRef
                           type: object
                         cache:
-                          description: Cache configures whether and how the provider caches responses.
+                          description: Cache configures whether the provider caches responses.
                           properties:
                             enable:
+                              description: Defaults to true
                               type: boolean
-                            ttl:
-                              type: integer
                           type: object
                         config:
                           description: Doppler config (required if not using a Service Token)
@@ -8506,12 +8505,11 @@ spec:
                             - secretRef
                           type: object
                         cache:
-                          description: Cache configures whether and how the provider caches responses.
+                          description: Cache configures whether the provider caches responses.
                           properties:
                             enable:
+                              description: Defaults to true
                               type: boolean
-                            ttl:
-                              type: integer
                           type: object
                         config:
                           description: Doppler config (required if not using a Service Token)
@@ -14436,12 +14434,11 @@ spec:
                             - secretRef
                           type: object
                         cache:
-                          description: Cache configures whether and how the provider caches responses.
+                          description: Cache configures whether the provider caches responses.
                           properties:
                             enable:
+                              description: Defaults to true
                               type: boolean
-                            ttl:
-                              type: integer
                           type: object
                         config:
                           description: Doppler config (required if not using a Service Token)
@@ -19325,12 +19322,11 @@ spec:
                             - secretRef
                           type: object
                         cache:
-                          description: Cache configures whether and how the provider caches responses.
+                          description: Cache configures whether the provider caches responses.
                           properties:
                             enable:
+                              description: Defaults to true
                               type: boolean
-                            ttl:
-                              type: integer
                           type: object
                         config:
                           description: Doppler config (required if not using a Service Token)
